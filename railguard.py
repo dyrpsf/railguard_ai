@@ -19,8 +19,11 @@ Final simplified logic for hackathon demo:
 
 - A RED transition automatically saves a snapshot in captures/CAMxx_YYYYMMDD_HHMMSS_RED.jpg
 
-This avoids unreliable automatic track detection and gives a very stable demo
-while still looking technical (multi-camera, graphs, logs, etc.).
+Extra “technical” features:
+- Per-camera metrics panel: current motion, occupied time, RED event count
+- Per-camera event log: crossing/tampering events with timestamps
+- Per-camera risk score (0–100) + progress bar
+- CSV logging: logs/CAMxx_YYYYMMDD_HHMMSS.csv with second-by-second data
 """
 
 import threading
@@ -69,7 +72,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("RailGuard Multi-Camera – Track Monitor")
-        self.iconbitmap("app_icon.ico") 
+        self.iconbitmap("app_icon.ico")
         self.geometry("1200x800")
 
         # Global state
@@ -79,6 +82,15 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.history: Dict[str, List[SecondReport]] = {}   # camera_id -> list[SecondReport]
         self.current_status: Dict[str, str] = {}           # camera_id -> status
         self.camera_rows: Dict[str, Dict[str, ctk.CTkBaseClass]] = {}  # widgets per camera
+
+        # Extra state for metrics / risk / logs
+        self.red_counts: Dict[str, int] = {}
+        self.risk_scores: Dict[str, int] = {}
+        self.logs_dir = Path("logs")
+        self.logs_dir.mkdir(exist_ok=True)
+        self.csv_paths: Dict[str, Path] = {}
+        self.session_start: float = 0.0
+        self.session_ts: str = ""
 
         # Directory to save RED-event snapshots
         self.capture_dir = Path("captures")
@@ -176,6 +188,8 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.camera_rows.clear()
         self.history.clear()
         self.current_status.clear()
+        self.red_counts.clear()
+        self.risk_scores.clear()
 
         n = self.num_cams_var.get()
         for i in range(n):
@@ -184,6 +198,7 @@ class RailGuardMultiCamApp(ctk.CTk):
             cam_frame = ctk.CTkFrame(self.cams_frame)
             cam_frame.pack(side="top", fill="x", padx=5, pady=5)
 
+            # Row 0: name + status
             label = ctk.CTkLabel(cam_frame, text=f"{cam_id}", font=ctk.CTkFont(size=14, weight="bold"))
             label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
 
@@ -195,6 +210,7 @@ class RailGuardMultiCamApp(ctk.CTk):
             )
             status_label.grid(row=0, column=1, padx=5, pady=2, sticky="w")
 
+            # Row 1: source config
             mode_label = ctk.CTkLabel(cam_frame, text="Source:", font=ctk.CTkFont(size=12))
             mode_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
 
@@ -217,8 +233,34 @@ class RailGuardMultiCamApp(ctk.CTk):
             )
             ip_entry.grid(row=1, column=2, padx=5, pady=2, sticky="w")
 
+            # Row 2: metrics label
+            metrics_label = ctk.CTkLabel(
+                cam_frame,
+                text="Motion: 0.0 | Occupied: 0.0s | RED events: 0",
+                font=ctk.CTkFont(size=11),
+            )
+            metrics_label.grid(row=2, column=0, columnspan=3, padx=5, pady=2, sticky="w")
+
+            # Row 3: risk bar + label
+            risk_bar = ctk.CTkProgressBar(cam_frame, width=150)
+            risk_bar.grid(row=3, column=0, padx=5, pady=2, sticky="w")
+            risk_bar.set(0.0)
+
+            risk_label = ctk.CTkLabel(
+                cam_frame,
+                text="Risk: 0 / 100",
+                font=ctk.CTkFont(size=11),
+            )
+            risk_label.grid(row=3, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+
+            # Row 4: per-second log
             log_box = ctk.CTkTextbox(cam_frame, width=600, height=80)
-            log_box.grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+            log_box.grid(row=4, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+
+            # Row 5: event log
+            event_box = ctk.CTkTextbox(cam_frame, width=600, height=60)
+            event_box.grid(row=5, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+
             cam_frame.grid_columnconfigure(2, weight=1)
 
             self.camera_rows[cam_id] = {
@@ -226,11 +268,17 @@ class RailGuardMultiCamApp(ctk.CTk):
                 "mode_combo": mode_combo,
                 "ip_entry": ip_entry,
                 "status_label": status_label,
+                "metrics_label": metrics_label,
+                "risk_bar": risk_bar,
+                "risk_label": risk_label,
                 "log_box": log_box,
+                "event_box": event_box,
             }
 
             self.history[cam_id] = []
             self.current_status[cam_id] = "NO_ROI"
+            self.red_counts[cam_id] = 0
+            self.risk_scores[cam_id] = 0
 
     # -------------- Monitoring logic -------------- #
 
@@ -242,14 +290,33 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.running = True
         self.history = {cid: [] for cid in self.camera_rows.keys()}
         self.current_status = {cid: "NO_ROI" for cid in self.camera_rows.keys()}
+        self.red_counts = {cid: 0 for cid in self.camera_rows.keys()}
+        self.risk_scores = {cid: 0 for cid in self.camera_rows.keys()}
+        self.csv_paths.clear()
+        self.session_start = time.time()
+        self.session_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.session_start))
 
         self.progress.configure(mode="indeterminate")
         self.progress.start()
 
         for cam_id, row in self.camera_rows.items():
             row["log_box"].delete("1.0", "end")
+            row["event_box"].delete("1.0", "end")
             row["status_label"].configure(text="Status: NO ROI (Select track)", text_color="grey")
+            row["metrics_label"].configure(
+                text="Motion: 0.0 | Occupied: 0.0s | RED events: 0"
+            )
+            row["risk_bar"].set(0.0)
+            row["risk_label"].configure(text="Risk: 0 / 100")
 
+        # Prepare CSV files
+        for cam_id in self.camera_rows.keys():
+            path = self.logs_dir / f"{cam_id}_{self.session_ts}.csv"
+            self.csv_paths[cam_id] = path
+            with open(path, "w", newline="") as f:
+                f.write("timestamp,elapsed_s,avg_motion,occupied_duration,status,risk_score\n")
+
+        # Launch monitoring threads
         self.monitor_threads = []
         for cam_id, row in self.camera_rows.items():
             mode = row["mode_var"].get()
@@ -590,6 +657,8 @@ class RailGuardMultiCamApp(ctk.CTk):
         while not self.data_queue.empty():
             report = self.data_queue.get()
             cam_id = report.camera_id
+            prev_status = self.current_status.get(cam_id, "NO_ROI")
+
             if report.status.startswith("ERROR"):
                 self.error_label.configure(text=f"{cam_id}: Camera error: {report.status}")
                 continue
@@ -606,6 +675,14 @@ class RailGuardMultiCamApp(ctk.CTk):
 
             row = self.camera_rows.get(cam_id)
             if row:
+                status_label = row["status_label"]
+                metrics_label = row["metrics_label"]
+                risk_bar = row["risk_bar"]
+                risk_label = row["risk_label"]
+                log_box = row["log_box"]
+                event_box = row["event_box"]
+
+                # Status label
                 if report.status == "NO_ROI":
                     text = "Status: NO ROI (Select track)"
                     color = "grey"
@@ -619,16 +696,73 @@ class RailGuardMultiCamApp(ctk.CTk):
                     text = "Status: RED"
                     color = "red"
 
-                row["status_label"].configure(text=text, text_color=color)
+                status_label.configure(text=text, text_color=color)
 
+                # Risk score (0-100) from motion + occupied duration
+                motion = report.avg_motion
+                occ = report.occupied_duration
+                motion_factor = min(1.0, motion / (MIN_MOTION_AREA * 3.0)) if MIN_MOTION_AREA > 0 else 0.0
+                occ_factor = min(1.0, occ / (TAMPERING_MIN_TIME * 2.0)) if TAMPERING_MIN_TIME > 0 else 0.0
+                risk = int(100 * (0.5 * motion_factor + 0.5 * occ_factor))
+                self.risk_scores[cam_id] = risk
+                risk_bar.set(risk / 100.0)
+                risk_label.configure(text=f"Risk: {risk} / 100")
+
+                # Detect events on status transitions
                 ts_str = time.strftime("%H:%M:%S", time.localtime(report.timestamp))
-                row["log_box"].insert(
+                if prev_status != report.status:
+                    if prev_status != "RED" and report.status == "RED":
+                        # new RED event
+                        self.red_counts[cam_id] += 1
+                        event_box.insert(
+                            "end",
+                            f"[{ts_str}] RED event START (motion={motion:.1f}, occupied={occ:.1f}s)\n",
+                        )
+                    elif prev_status != "YELLOW" and report.status == "YELLOW":
+                        event_box.insert(
+                            "end",
+                            f"[{ts_str}] Crossing detected (YELLOW)\n",
+                        )
+                    elif prev_status == "YELLOW" and report.status == "GREEN":
+                        event_box.insert(
+                            "end",
+                            f"[{ts_str}] Crossing cleared\n",
+                        )
+                    elif prev_status == "RED" and report.status == "GREEN":
+                        event_box.insert(
+                            "end",
+                            f"[{ts_str}] Tampering cleared\n",
+                        )
+                    event_box.see("end")
+
+                # Metrics label
+                metrics_label.configure(
+                    text=f"Motion: {motion:.1f} | Occupied: {occ:.1f}s | RED events: {self.red_counts[cam_id]}"
+                )
+
+                # Per-second log
+                log_ts_str = ts_str
+                log_box.insert(
                     "end",
-                    f"[{ts_str}] status={report.status:<8} "
+                    f"[{log_ts_str}] status={report.status:<8} "
                     f"motion={report.avg_motion:>7.1f} "
                     f"occupied={report.occupied_duration:>4.1f}s\n",
                 )
-                row["log_box"].see("end")
+                log_box.see("end")
+
+                # CSV logging
+                if cam_id in self.csv_paths:
+                    elapsed = report.timestamp - self.session_start
+                    csv_line = (
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(report.timestamp))},"
+                        f"{elapsed:.1f},{report.avg_motion:.1f},"
+                        f"{report.occupied_duration:.1f},{report.status},{risk}\n"
+                    )
+                    try:
+                        with open(self.csv_paths[cam_id], "a", newline="") as f:
+                            f.write(csv_line)
+                    except Exception as e:
+                        print(f"[WARN] Failed to write CSV for {cam_id}: {e}")
 
         if updated_any:
             self.progress.stop()
