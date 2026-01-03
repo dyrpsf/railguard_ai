@@ -1,16 +1,26 @@
 """
 RailGuard Multi-Camera GUI – Track Monitoring with CustomTkinter
 
-Logic:
-- For each camera, we try to detect the railway track (two rails) automatically
-  on EVERY frame using vertical-line detection in the CENTRAL part of the image.
-- ONLY when tracks are visible do we run tampering logic:
-    GREEN  – track clear (no obstacle in track region)
-    YELLOW – short-lived obstacle crossing the track
-    RED    – persistent obstacle staying on/near the track
-- If tracks are not visible / not detected in the current frame, we show:
-    "TRACK NOT VISIBLE" and do NOT classify tampering.
-- When a camera first enters RED, we save a snapshot in 'captures/' with timestamp.
+Final simplified logic for hackathon demo:
+- For each camera, when you start monitoring:
+    1) Grab a frame.
+    2) Show a window to let you DRAW a rectangle around the TRACK region.
+       (one-time calibration per camera using cv2.selectROI)
+    3) That rectangle is stored as the track ROI.
+
+- During monitoring:
+    - Background subtraction is applied to the full frame.
+    - Any moving contour that overlaps the track ROI (with a small margin) is
+      treated as an obstacle.
+    - Per second, we aggregate motion inside that track ROI and classify:
+        GREEN  – no obstacle on/near the track
+        YELLOW – obstacle present but occupied_duration < TAMPERING_MIN_TIME
+        RED    – obstacle continuously present on/near track >= TAMPERING_MIN_TIME
+
+- A RED transition automatically saves a snapshot in captures/CAMxx_YYYYMMDD_HHMMSS_RED.jpg
+
+This avoids unreliable automatic track detection and gives a very stable demo
+while still looking technical (multi-camera, graphs, logs, etc.).
 """
 
 import threading
@@ -28,7 +38,6 @@ import queue
 
 # ---------------- Parameters (tune for your toy setup) ---------------- #
 
-# More sensitive for a small toy track and hand-sized obstacles
 MIN_MOTION_AREA = 200.0         # sum of obstacle areas per second -> "something present"
 OBSTACLE_MIN_AREA = 300.0       # minimum contour area to draw "Obstacle" box
 TAMPERING_MIN_TIME = 2.0        # seconds: continuous presence -> RED
@@ -49,7 +58,7 @@ class SecondReport:
     timestamp: float
     avg_motion: float
     occupied_duration: float
-    status: str  # "GREEN", "YELLOW", "RED", "NO_TRACK", or "ERROR_*"
+    status: str  # "GREEN", "YELLOW", "RED", "NO_ROI", or "ERROR_*"
 
 
 class RailGuardMultiCamApp(ctk.CTk):
@@ -60,7 +69,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("RailGuard Multi-Camera – Track Monitor")
-        self.iconbitmap("app_icon.ico")
+        self.iconbitmap("app_icon.ico") 
         self.geometry("1200x800")
 
         # Global state
@@ -145,7 +154,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.ax_status = self.fig.add_subplot(212, sharex=self.ax_motion)
 
         self.ax_motion.set_ylabel("Avg Motion")
-        self.ax_status.set_ylabel("Status\n-1=NoTrack,0=G,1=Y,2=R")
+        self.ax_status.set_ylabel("Status\n-1=NoROI,0=G,1=Y,2=R")
         self.ax_status.set_xlabel("Seconds (most recent at 0)")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.bottom_frame)
@@ -180,7 +189,7 @@ class RailGuardMultiCamApp(ctk.CTk):
 
             status_label = ctk.CTkLabel(
                 cam_frame,
-                text="Status: NO TRACK",
+                text="Status: NO ROI (Select track)",
                 font=ctk.CTkFont(size=14, weight="bold"),
                 text_color="grey",
             )
@@ -221,7 +230,7 @@ class RailGuardMultiCamApp(ctk.CTk):
             }
 
             self.history[cam_id] = []
-            self.current_status[cam_id] = "NO_TRACK"
+            self.current_status[cam_id] = "NO_ROI"
 
     # -------------- Monitoring logic -------------- #
 
@@ -232,14 +241,14 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.error_label.configure(text="")
         self.running = True
         self.history = {cid: [] for cid in self.camera_rows.keys()}
-        self.current_status = {cid: "NO_TRACK" for cid in self.camera_rows.keys()}
+        self.current_status = {cid: "NO_ROI" for cid in self.camera_rows.keys()}
 
         self.progress.configure(mode="indeterminate")
         self.progress.start()
 
         for cam_id, row in self.camera_rows.items():
             row["log_box"].delete("1.0", "end")
-            row["status_label"].configure(text="Status: NO TRACK", text_color="grey")
+            row["status_label"].configure(text="Status: NO ROI (Select track)", text_color="grey")
 
         self.monitor_threads = []
         for cam_id, row in self.camera_rows.items():
@@ -309,83 +318,49 @@ class RailGuardMultiCamApp(ctk.CTk):
             return False
         return True
 
-    def detect_track_roi_from_frame(self, frame) -> Optional[tuple]:
+    def select_track_roi(self, cap, cam_id: str) -> Optional[tuple]:
         """
-        Detect approximate track region from a frame by finding two long vertical rails
-        in the CENTRAL band of the image. Tuned for your toy track drawn as two
-        vertical dark lines on white paper.
-
-        Returns (x1, y1, x2, y2) or None if detection fails.
+        Grab one frame from the camera and let the user draw the track ROI.
+        Returns (x1, y1, x2, y2) or None if user cancels / invalid.
         """
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        print(f"[INFO] Selecting track ROI for {cam_id}...")
 
-        # Crop central band horizontally to ignore left/right borders
-        x_crop1 = int(w * 0.20)
-        x_crop2 = int(w * 0.80)
-        cropped = gray[:, x_crop1:x_crop2]
+        # Read a few frames to let camera auto-exposure stabilise
+        for _ in range(5):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            time.sleep(0.05)
 
-        # Threshold: rails are dark on light → invert binary
-        _, bw = cv2.threshold(
-            cropped, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[WARN] Could not read frame for ROI selection on {cam_id}")
+            return None
+
+        clone = frame.copy()
+        cv2.putText(
+            clone,
+            f"{cam_id}: Draw rectangle around TRACK, then press ENTER/SPACE (ESC to cancel)",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
         )
 
-        # Emphasize vertical structures
-        k_h = max(15, h // 15)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, k_h))
-        vert = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+        roi = cv2.selectROI(f"Select TRACK region - {cam_id}", clone, fromCenter=False, showCrosshair=True)
+        cv2.destroyWindow(f"Select TRACK region - {cam_id}")
 
-        contours, _ = cv2.findContours(vert, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates = []
-        for c in contours:
-            x, y, w_box, h_box = cv2.boundingRect(c)
-            x_full = x + x_crop1
-            # rails should be tall and thin
-            if h_box < h * 0.6:
-                continue
-            if w_box > w * 0.2:
-                continue
-            aspect = h_box / max(w_box, 1)
-            if aspect < 4.0:
-                continue
-            x_center = x_full + w_box / 2.0
-            # stay away from extreme borders even inside crop
-            if not (w * 0.25 <= x_center <= w * 0.75):
-                continue
-            candidates.append((h_box, x_full, y, x_full + w_box, y + h_box))
-
-        if len(candidates) < 2:
+        x, y, w_box, h_box = roi
+        if w_box <= 0 or h_box <= 0:
+            print(f"[WARN] No ROI selected for {cam_id}")
             return None
 
-        # Sort by height descending
-        candidates.sort(reverse=True, key=lambda t: t[0])
-        best1 = candidates[0]
-        x_center1 = (best1[1] + best1[3]) / 2.0
-
-        best2 = None
-        for cand in candidates[1:]:
-            x_center2 = (cand[1] + cand[3]) / 2.0
-            sep = abs(x_center2 - x_center1)
-            if w * 0.05 <= sep <= w * 0.5:
-                best2 = cand
-                break
-
-        if best2 is None:
-            return None
-
-        xs = [best1[1], best1[3], best2[1], best2[3]]
-        ys = [best1[2], best1[4], best2[2], best2[4]]
-
-        x1 = max(0, min(xs) - 10)
-        x2 = min(w - 1, max(xs) + 10)
-        y1 = max(0, min(ys) - 10)
-        y2 = min(h - 1, max(ys) + 10)
-
-        if (x2 - x1) < 20 or (y2 - y1) < 20:
-            return None
-
-        return int(x1), int(y1), int(x2), int(y2)
+        x1, y1 = int(x), int(y)
+        x2, y2 = int(x + w_box), int(y + h_box)
+        print(f"[INFO] {cam_id} ROI selected: {(x1, y1, x2, y2)}")
+        return x1, y1, x2, y2
 
     def monitor_loop(self, cam_cfg: CameraConfig):
         cam_id = cam_cfg.camera_id
@@ -404,6 +379,22 @@ class RailGuardMultiCamApp(ctk.CTk):
                         status="ERROR_OPEN",
                     )
                 )
+                return
+
+            # One-time manual ROI selection
+            track_roi = self.select_track_roi(cap, cam_id)
+            if track_roi is None:
+                # No ROI selected -> NO_ROI status
+                self.data_queue.put(
+                    SecondReport(
+                        camera_id=cam_id,
+                        timestamp=time.time(),
+                        avg_motion=0.0,
+                        occupied_duration=0.0,
+                        status="NO_ROI",
+                    )
+                )
+                cap.release()
                 return
 
             bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -426,63 +417,6 @@ class RailGuardMultiCamApp(ctk.CTk):
                 now = time.time()
                 current_sec = int(now)
 
-                # --- Detect track on THIS frame ---
-                track_roi = self.detect_track_roi_from_frame(frame)
-
-                if track_roi is None:
-                    # TRACK NOT VISIBLE: report NO_TRACK once per second
-                    if current_sec != last_second:
-                        report = SecondReport(
-                            camera_id=cam_id,
-                            timestamp=now,
-                            avg_motion=0.0,
-                            occupied_duration=0.0,
-                            status="NO_TRACK",
-                        )
-                        self.data_queue.put(report)
-                        last_second = current_sec
-                        motion_acc = 0.0
-                        frame_count = 0
-
-                    display_frame = frame.copy()
-                    cv2.putText(
-                        display_frame,
-                        f"{cam_id}",
-                        (20, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    ts_str = time.strftime("%H:%M:%S", time.localtime(now))
-                    cv2.putText(
-                        display_frame,
-                        ts_str,
-                        (w_frame - 140, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        display_frame,
-                        "TRACK NOT VISIBLE",
-                        (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (180, 180, 180),
-                        2,
-                        cv2.LINE_AA,
-                    )
-
-                    cv2.imshow(window_name, display_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-                    continue  # skip tampering logic until track visible
-
-                # --- Track is visible: run motion/tampering logic --- #
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 fgmask_full = bg_subtractor.apply(gray)
                 _, fgmask = cv2.threshold(fgmask_full, 250, 255, cv2.THRESH_BINARY)
@@ -580,6 +514,26 @@ class RailGuardMultiCamApp(ctk.CTk):
                     cv2.LINE_AA,
                 )
 
+                # status from last report in UI
+                current_status = self.current_status.get(cam_id, "GREEN")
+                color = (
+                    (0, 255, 0)
+                    if current_status == "GREEN"
+                    else (0, 255, 255)
+                    if current_status == "YELLOW"
+                    else (0, 0, 255)
+                )
+                cv2.putText(
+                    display_frame,
+                    f"Status: {current_status}",
+                    (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.putText(
                     display_frame,
                     "TRACK",
@@ -587,31 +541,6 @@ class RailGuardMultiCamApp(ctk.CTk):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
                     (200, 200, 200),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-                current_status = self.current_status.get(cam_id, "GREEN")
-                if current_status == "NO_TRACK":
-                    status_text = "TRACK NOT VISIBLE"
-                    color = (180, 180, 180)
-                else:
-                    status_text = f"Status: {current_status}"
-                    color = (
-                        (0, 255, 0)
-                        if current_status == "GREEN"
-                        else (0, 255, 255)
-                        if current_status == "YELLOW"
-                        else (0, 0, 255)
-                    )
-
-                cv2.putText(
-                    display_frame,
-                    status_text,
-                    (20, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color,
                     2,
                     cv2.LINE_AA,
                 )
@@ -677,8 +606,8 @@ class RailGuardMultiCamApp(ctk.CTk):
 
             row = self.camera_rows.get(cam_id)
             if row:
-                if report.status == "NO_TRACK":
-                    text = "Status: TRACK NOT VISIBLE"
+                if report.status == "NO_ROI":
+                    text = "Status: NO ROI (Select track)"
                     color = "grey"
                 elif report.status == "GREEN":
                     text = "Status: GREEN"
@@ -717,7 +646,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.ax_status.clear()
 
         colors = ["cyan", "magenta", "yellow", "lime"]
-        status_map = {"NO_TRACK": -1, "GREEN": 0, "YELLOW": 1, "RED": 2}
+        status_map = {"NO_ROI": -1, "GREEN": 0, "YELLOW": 1, "RED": 2}
 
         for idx, (cam_id, reports) in enumerate(self.history.items()):
             if not reports:
@@ -768,7 +697,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         )
 
         self.ax_motion.set_ylabel("Avg Motion")
-        self.ax_status.set_ylabel("Status / Occupied\n-1=NoTrack,0=G,1=Y,2=R")
+        self.ax_status.set_ylabel("Status / Occupied\n-1=NoROI,0=G,1=Y,2=R")
         self.ax_status.set_xlabel("Seconds (most recent at 0)")
 
         self.ax_motion.legend(loc="upper left", fontsize=8)
