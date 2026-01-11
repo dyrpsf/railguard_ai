@@ -1,35 +1,7 @@
-"""
-RailGuard Multi-Camera GUI – Track Monitoring with CustomTkinter
-
-Final simplified logic for hackathon demo:
-- For each camera, when you start monitoring:
-    1) Grab a frame.
-    2) Show a window to let you DRAW a rectangle around the TRACK region.
-       (one-time calibration per camera using cv2.selectROI)
-    3) That rectangle is stored as the track ROI.
-
-- During monitoring:
-    - Background subtraction is applied to the full frame.
-    - Any moving contour that overlaps the track ROI (with a small margin) is
-      treated as an obstacle.
-    - Per second, we aggregate motion inside that track ROI and classify:
-        GREEN  – no obstacle on/near the track
-        YELLOW – obstacle present but occupied_duration < TAMPERING_MIN_TIME
-        RED    – obstacle continuously present on/near track >= TAMPERING_MIN_TIME
-
-- A RED transition automatically saves a snapshot in captures/CAMxx_YYYYMMDD_HHMMSS_RED.jpg
-
-Extra “technical” features:
-- Per-camera metrics panel: current motion, occupied time, RED event count
-- Per-camera event log: crossing/tampering events with timestamps
-- Per-camera risk score (0–100) + progress bar
-- CSV logging: logs/CAMxx_YYYYMMDD_HHMMSS.csv with second-by-second data
-"""
-
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any, Set
 from pathlib import Path
 
 import cv2
@@ -38,15 +10,17 @@ import customtkinter as ctk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import queue
+import pyttsx3
+import speech_recognition as sr
+from playsound3 import playsound
 
-# ---------------- Parameters (tune for your toy setup) ---------------- #
 
-MIN_MOTION_AREA = 200.0         # sum of obstacle areas per second -> "something present"
-OBSTACLE_MIN_AREA = 300.0       # minimum contour area to draw "Obstacle" box
-TAMPERING_MIN_TIME = 2.0        # seconds: continuous presence -> RED
-HISTORY_SECONDS = 60            # show last N seconds in plots/logs
-MAX_CAMERAS = 4                 # hard limit for GUI
-TRACK_MARGIN = 25               # extra pixels around track ROI for "near track"
+MIN_MOTION_AREA = 200.0
+OBSTACLE_MIN_AREA = 300.0
+TAMPERING_MIN_TIME = 2.0
+HISTORY_SECONDS = 60
+MAX_CAMERAS = 4
+TRACK_MARGIN = 25
 
 
 @dataclass
@@ -64,6 +38,20 @@ class SecondReport:
     status: str  # "GREEN", "YELLOW", "RED", "NO_ROI", or "ERROR_*"
 
 
+@dataclass
+class AlertSession:
+    """
+    Global alert session that merges all RED events occurring
+    while the alert workflow (speech / mic / alarm) is running.
+    """
+    id: int
+    start_time: float
+    captures: List[Dict[str, Any]]
+    workflow_started: bool = False
+    resolved: bool = False
+    camera_ids: Set[str] = None  # cameras involved in this session
+
+
 class RailGuardMultiCamApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -71,7 +59,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        self.title("RailGuard Multi-Camera – Track Monitor")
+        self.title("RailGuard AI Multi-Camera - Track Monitor")
         self.iconbitmap("app_icon.ico")
         self.geometry("1200x800")
 
@@ -82,6 +70,9 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.history: Dict[str, List[SecondReport]] = {}   # camera_id -> list[SecondReport]
         self.current_status: Dict[str, str] = {}           # camera_id -> status
         self.camera_rows: Dict[str, Dict[str, ctk.CTkBaseClass]] = {}  # widgets per camera
+
+        # New: per-camera monitoring disable flags
+        self.monitoring_disabled: Dict[str, bool] = {}
 
         # Extra state for metrics / risk / logs
         self.red_counts: Dict[str, int] = {}
@@ -96,6 +87,20 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.capture_dir = Path("captures")
         self.capture_dir.mkdir(exist_ok=True)
 
+        # --- New: global alert / audio state ---
+        self.alert_lock = threading.Lock()
+        self.current_alert_session: Optional[AlertSession] = None
+        self.next_alert_session_id: int = 1
+
+        # TTS engine (if available)
+        self.tts_engine = None
+        if pyttsx3 is not None:
+            try:
+                self.tts_engine = pyttsx3.init()
+            except Exception as e:
+                print("[WARN] Failed to initialize TTS engine:", e)
+                self.tts_engine = None
+
         # Build UI
         self._build_ui()
 
@@ -103,8 +108,6 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.after(500, self.update_ui)
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-    # -------------- UI construction -------------- #
 
     def _build_ui(self):
         # Top control frame
@@ -173,6 +176,18 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(fill="both", expand=True)
 
+        # Global bottom status bar for monitoring-off info
+        self.status_frame = ctk.CTkFrame(self)
+        self.status_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+
+        self.monitoring_off_label = ctk.CTkLabel(
+            self.status_frame,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="orange",
+        )
+        self.monitoring_off_label.pack(side="left", padx=5, pady=5)
+
         self._rebuild_camera_rows()
 
     def _on_num_cams_changed(self, _value: str):
@@ -190,6 +205,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.current_status.clear()
         self.red_counts.clear()
         self.risk_scores.clear()
+        self.monitoring_disabled.clear()
 
         n = self.num_cams_var.get()
         for i in range(n):
@@ -261,6 +277,16 @@ class RailGuardMultiCamApp(ctk.CTk):
             event_box = ctk.CTkTextbox(cam_frame, width=600, height=60)
             event_box.grid(row=5, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
 
+            # Row 6: monitoring toggle
+            monitoring_var = ctk.BooleanVar(value=False)
+            monitoring_checkbox = ctk.CTkCheckBox(
+                cam_frame,
+                text="Temporarily disable track monitoring for this camera",
+                variable=monitoring_var,
+                command=lambda cid=cam_id, var=monitoring_var: self.on_monitoring_toggle(cid, var),
+            )
+            monitoring_checkbox.grid(row=6, column=0, columnspan=3, padx=5, pady=(2, 5), sticky="w")
+
             cam_frame.grid_columnconfigure(2, weight=1)
 
             self.camera_rows[cam_id] = {
@@ -273,14 +299,45 @@ class RailGuardMultiCamApp(ctk.CTk):
                 "risk_label": risk_label,
                 "log_box": log_box,
                 "event_box": event_box,
+                "monitoring_var": monitoring_var,
+                "monitoring_checkbox": monitoring_checkbox,
             }
 
             self.history[cam_id] = []
             self.current_status[cam_id] = "NO_ROI"
             self.red_counts[cam_id] = 0
             self.risk_scores[cam_id] = 0
+            self.monitoring_disabled[cam_id] = False
 
-    # -------------- Monitoring logic -------------- #
+        self.update_monitoring_status_label()
+
+    def on_monitoring_toggle(self, cam_id: str, var: ctk.BooleanVar):
+        """
+        Called when the 'disable monitoring' checkbox for a camera is toggled.
+        """
+        self.monitoring_disabled[cam_id] = bool(var.get())
+        self.update_monitoring_status_label()
+
+    def update_monitoring_status_label(self):
+        """
+        Updates the global bottom label summarizing which cameras have monitoring disabled.
+        """
+        if not hasattr(self, "monitoring_off_label"):
+            return
+
+        disabled_cams = sorted([cid for cid, disabled in self.monitoring_disabled.items() if disabled])
+        if not disabled_cams:
+            self.monitoring_off_label.configure(text="")
+        elif len(disabled_cams) == 1:
+            cid = disabled_cams[0]
+            self.monitoring_off_label.configure(
+                text=f"Track monitoring is currently disabled for camera {cid}."
+            )
+        else:
+            ids_str = ", ".join(disabled_cams)
+            self.monitoring_off_label.configure(
+                text=f"Track monitoring is currently disabled for multiple cameras (IDs: {ids_str})."
+            )
 
     def start_monitoring(self):
         if self.running:
@@ -363,6 +420,267 @@ class RailGuardMultiCamApp(ctk.CTk):
             print(f"[INFO] Saved RED capture for {cam_id} at {filename}")
         except Exception as e:
             print(f"[WARN] Failed to save capture for {cam_id}: {e}")
+
+    # -------- ALERT / AUDIO LOGIC (DETECTION LOGIC UNCHANGED) -------- #
+
+    def handle_red_frame(self, cam_id: str, frame, timestamp: float):
+        """
+        Called instead of saving immediately whenever a new RED event starts.
+        It buffers captures into a global AlertSession and triggers the
+        speech / listening / alarm workflow once per session.
+        """
+        with self.alert_lock:
+            session = self.current_alert_session
+
+            # If there is no active session (or it was resolved), start a new one
+            if session is None or session.resolved:
+                session_id = self.next_alert_session_id
+                self.next_alert_session_id += 1
+                session = AlertSession(
+                    id=session_id,
+                    start_time=timestamp,
+                    captures=[],
+                    workflow_started=False,
+                    resolved=False,
+                    camera_ids=set(),
+                )
+                self.current_alert_session = session
+                print(f"[INFO] Created new alert session {session.id} at {timestamp}")
+
+            # Track which cameras are involved in this session
+            session.camera_ids.add(cam_id)
+
+            # Merge all RED captures while the workflow is running
+            session.captures.append(
+                {
+                    "camera_id": cam_id,
+                    "frame": frame.copy(),
+                    "timestamp": timestamp,
+                }
+            )
+            print(f"[DEBUG] Alert session {session.id}: added capture from {cam_id}")
+
+            # Start the workflow only once for this session
+            if not session.workflow_started:
+                session.workflow_started = True
+                t = threading.Thread(
+                    target=self.alert_workflow,
+                    args=(session.id,),
+                    daemon=True,
+                )
+                t.start()
+
+    def alert_workflow(self, session_id: int):
+
+        print(f"[INFO] Starting alert workflow for session {session_id}")
+
+        # Get camera IDs for announcement at the start of the workflow
+        with self.alert_lock:
+            session = self.current_alert_session
+            if session is None or session.id != session_id:
+                return
+            cam_ids_for_alert = sorted(session.camera_ids) if session.camera_ids else []
+
+        # 1) Speak alert (with camera id(s) included in the message)
+        try:
+            self.speak_alert_message(cam_ids_for_alert)
+        except Exception as e:
+            print(f"[WARN] Failed to speak alert message: {e}")
+
+        # 2) Listen for reply (up to 15s)
+        reply_text: Optional[str] = None
+        try:
+            reply_text = self.listen_for_reply(timeout=15)
+        except Exception as e:
+            print(f"[WARN] Error while listening for reply: {e}")
+            reply_text = None
+
+        # 3) Decide based on reply
+        # None => no voice activity / timeout / mic issue
+        normalized = reply_text.strip().lower() if reply_text is not None else None
+
+        if normalized is None:
+            decision = "NO_REPLY"
+        elif "all is well" in normalized:
+            decision = "ALL_IS_WELL"
+        elif "taking action" in normalized:
+            decision = "TAKING_ACTION"
+        elif normalized == "":
+            # Some speech but not understood -> treat as "other reply"
+            decision = "OTHER"
+        else:
+            decision = "OTHER"
+
+        print(f"[INFO] Session {session_id} decision={decision}, recognized={reply_text!r}")
+
+        # 3b) Reaction speech / alarm according to your requirements:
+        #   - ALL_IS_WELL  -> speak polite short 'everything is fine' message
+        #   - TAKING_ACTION or OTHER -> speak short 'thank you for taking action' message
+        #   - NO_REPLY     -> directly play danger.mp3 (no spoken reply)
+        try:
+            if decision == "ALL_IS_WELL":
+                self.speak_all_is_well_ack()
+            elif decision in ("TAKING_ACTION", "OTHER"):
+                self.speak_taking_action_ack()
+            elif decision == "NO_REPLY":
+                self.play_danger_alarm()
+        except Exception as e:
+            print(f"[WARN] Error during acknowledgement / alarm: {e}")
+
+        # 4) Finalize: snapshot captures & mark session resolved.
+        with self.alert_lock:
+            session = self.current_alert_session
+            if session is None or session.id != session_id:
+                # Session replaced or already cleared
+                return
+
+            # Mark resolved so future REDs create a new session.
+            session.resolved = True
+            captures = list(session.captures)
+            # End this session; new reds after this moment will create a new one.
+            self.current_alert_session = None
+
+        # Capture-saving logic remains the same:
+        #   - ALL_IS_WELL: discard captures
+        #   - others: save captures
+        if decision == "ALL_IS_WELL":
+            print(f"[INFO] Session {session_id}: 'All is well' -> discarding {len(captures)} capture(s).")
+            return
+
+        print(f"[INFO] Session {session_id}: saving {len(captures)} capture(s).")
+        for cap in captures:
+            try:
+                self.save_capture(cap["camera_id"], cap["frame"], cap["timestamp"])
+            except Exception as e:
+                print(f"[WARN] Failed to save merged capture for {cap['camera_id']}: {e}")
+
+    def speak_alert_message(self, camera_ids: Optional[List[str]] = None):
+        """
+        Speaks the alert message, including camera id(s) in the text.
+        If TTS is unavailable, just logs a warning.
+        """
+        if self.tts_engine is None:
+            print("[WARN] TTS engine not available; cannot speak alert message.")
+            return
+
+        # Base alert text
+        if camera_ids:
+            if len(camera_ids) == 1:
+                location = f" in {camera_ids[0]}"
+            else:
+                # e.g., "in cameras CAM01 and CAM02"
+                if len(camera_ids) == 2:
+                    location = f" in cameras {camera_ids[0]} and {camera_ids[1]}"
+                else:
+                    location = " in cameras " + ", ".join(camera_ids[:-1]) + f", and {camera_ids[-1]}"
+        else:
+            location = ""
+
+        text = (
+            f"Alert! miscellaneous thing found on the track{location}. "
+            "Please reply 'All is well' if all things are fine, "
+            "or reply 'taking action'."
+        )
+
+        try:
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"[WARN] TTS error: {e}")
+
+    def speak_all_is_well_ack(self):
+        """
+        Speaks a short polite message when the operator replies 'All is well'.
+        """
+        if self.tts_engine is None:
+            print("[INFO] ALL_IS_WELL acknowledgement (TTS not available).")
+            return
+
+        text = "It is good that everything is fine."
+        try:
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"[WARN] TTS error in ALL_IS_WELL acknowledgement: {e}")
+
+    def speak_taking_action_ack(self):
+        """
+        Speaks a short message when the operator says 'taking action'
+        or any other reply.
+        """
+        if self.tts_engine is None:
+            print("[INFO] TAKING_ACTION / OTHER acknowledgement (TTS not available).")
+            return
+
+        text = "Thank you for taking action. I have saved the captures and log of the movement"
+        try:
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print(f"[WARN] TTS error in TAKING_ACTION acknowledgement: {e}")
+
+    def listen_for_reply(self, timeout: int = 15) -> Optional[str]:
+        """
+        Listens to microphone for up to `timeout` seconds.
+        Returns:
+          - recognized text (string) if there is a reply,
+          - "" if speech is heard but not understood,
+          - None if there is no reply / timeout / mic unavailable.
+        """
+        if sr is None:
+            print("[WARN] speech_recognition not available; treating as no reply.")
+            return None
+
+        recognizer = sr.Recognizer()
+        try:
+            with sr.Microphone() as source:
+                print(f"[INFO] Listening for operator reply (up to {timeout}s)...")
+                try:
+                    recognizer.adjust_for_ambient_noise(source, duration=1)
+                except Exception:
+                    # Non-fatal; continue without adjustment
+                    pass
+
+                try:
+                    audio = recognizer.listen(source, timeout=timeout)
+                except sr.WaitTimeoutError:
+                    print("[INFO] No voice input detected within timeout.")
+                    return None
+        except Exception as e:
+            print(f"[WARN] Could not access microphone: {e}")
+            return None
+
+        try:
+            text = recognizer.recognize_google(audio)
+            print(f"[INFO] Recognized reply: {text}")
+            return text
+        except sr.UnknownValueError:
+            print("[INFO] Speech heard but not understood.")
+            return ""
+        except sr.RequestError as e:
+            print(f"[WARN] Speech recognition service error: {e}")
+            return ""
+
+    def play_danger_alarm(self):
+        """
+        Plays the danger alarm (danger.mp3) when there is no reply.
+        """
+        if playsound is None:
+            print("[WARN] playsound not available; cannot play danger alarm.")
+            return
+
+        sound_path = Path("danger.mp3")
+        if not sound_path.exists():
+            print("[WARN] danger.mp3 not found in current folder; cannot play alarm.")
+            return
+
+        try:
+            print("[INFO] Playing danger alarm...")
+            playsound(str(sound_path))
+        except Exception as e:
+            print(f"[WARN] Error playing danger alarm: {e}")
+
+    # ----------------------------------------------------------------------- #
 
     @staticmethod
     def rectangles_intersect(box, roi) -> bool:
@@ -484,6 +802,8 @@ class RailGuardMultiCamApp(ctk.CTk):
                 now = time.time()
                 current_sec = int(now)
 
+                monitoring_off = self.monitoring_disabled.get(cam_id, False)
+
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 fgmask_full = bg_subtractor.apply(gray)
                 _, fgmask = cv2.threshold(fgmask_full, 250, 255, cv2.THRESH_BINARY)
@@ -515,36 +835,43 @@ class RailGuardMultiCamApp(ctk.CTk):
                     else:
                         avg_motion = 0.0
 
-                    if avg_motion > MIN_MOTION_AREA:
-                        if occupied_since is None:
-                            occupied_since = now
-                        occupied_duration = now - occupied_since
+                    if not monitoring_off:
+                        if avg_motion > MIN_MOTION_AREA:
+                            if occupied_since is None:
+                                occupied_since = now
+                            occupied_duration = now - occupied_since
 
-                        if occupied_duration >= TAMPERING_MIN_TIME:
-                            status = "RED"
+                            if occupied_duration >= TAMPERING_MIN_TIME:
+                                status = "RED"
+                            else:
+                                status = "YELLOW"
                         else:
-                            status = "YELLOW"
+                            occupied_since = None
+                            occupied_duration = 0.0
+                            status = "GREEN"
+
+                        report = SecondReport(
+                            camera_id=cam_id,
+                            timestamp=now,
+                            avg_motion=avg_motion,
+                            occupied_duration=occupied_duration,
+                            status=status,
+                        )
+                        self.data_queue.put(report)
+
+                        # Buffer RED captures instead of saving immediately
+                        if status == "RED" and last_status_for_capture != "RED":
+                            try:
+                                self.handle_red_frame(cam_id, frame, now)
+                            except Exception as e:
+                                print(f"[WARN] Error handling RED frame for {cam_id}: {e}")
+
+                        last_status_for_capture = status
                     else:
+                        # When monitoring is off, reset occupancy-related state
                         occupied_since = None
-                        occupied_duration = 0.0
-                        status = "GREEN"
+                        last_status_for_capture = None
 
-                    report = SecondReport(
-                        camera_id=cam_id,
-                        timestamp=now,
-                        avg_motion=avg_motion,
-                        occupied_duration=occupied_duration,
-                        status=status,
-                    )
-                    self.data_queue.put(report)
-
-                    if status == "RED" and last_status_for_capture != "RED":
-                        try:
-                            self.save_capture(cam_id, frame, now)
-                        except Exception as e:
-                            print(f"[WARN] Error saving capture for {cam_id}: {e}")
-
-                    last_status_for_capture = status
                     motion_acc = 0.0
                     frame_count = 0
                     last_second = current_sec
@@ -583,6 +910,7 @@ class RailGuardMultiCamApp(ctk.CTk):
 
                 # status from last report in UI
                 current_status = self.current_status.get(cam_id, "GREEN")
+                status_text = current_status
                 color = (
                     (0, 255, 0)
                     if current_status == "GREEN"
@@ -590,9 +918,14 @@ class RailGuardMultiCamApp(ctk.CTk):
                     if current_status == "YELLOW"
                     else (0, 0, 255)
                 )
+
+                if monitoring_off:
+                    status_text = "MONITORING OFF"
+                    color = (180, 180, 180)
+
                 cv2.putText(
                     display_frame,
-                    f"Status: {current_status}",
+                    f"Status: {status_text}",
                     (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -612,24 +945,37 @@ class RailGuardMultiCamApp(ctk.CTk):
                     cv2.LINE_AA,
                 )
 
-                for (x, y, w_box, h_box) in obstacle_boxes:
-                    cv2.rectangle(
-                        display_frame,
-                        (x, y),
-                        (x + w_box, y + h_box),
-                        (255, 0, 255),
-                        2,
-                    )
+                if monitoring_off:
                     cv2.putText(
                         display_frame,
-                        "Obstacle",
-                        (x, y - 5),
+                        "Track monitoring is temporarily disabled.",
+                        (20, h_frame - 50),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
-                        (255, 0, 255),
+                        (0, 0, 255),
                         2,
                         cv2.LINE_AA,
                     )
+
+                if not monitoring_off:
+                    for (x, y, w_box, h_box) in obstacle_boxes:
+                        cv2.rectangle(
+                            display_frame,
+                            (x, y),
+                            (x + w_box, y + h_box),
+                            (255, 0, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            display_frame,
+                            "Obstacle",
+                            (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                 cv2.imshow(window_name, display_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -750,7 +1096,7 @@ class RailGuardMultiCamApp(ctk.CTk):
                 )
                 log_box.see("end")
 
-                # CSV logging
+                # CSV logging (unchanged)
                 if cam_id in self.csv_paths:
                     elapsed = report.timestamp - self.session_start
                     csv_line = (
@@ -839,8 +1185,6 @@ class RailGuardMultiCamApp(ctk.CTk):
 
         self.fig.tight_layout()
         self.canvas.draw()
-
-    # -------------- Misc -------------- #
 
     def on_closing(self):
         self.running = False
