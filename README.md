@@ -295,5 +295,3 @@ This project is open-source and intended for educational & research purposes.
 
 Deepak Yadav
 B.Tech. CSE Core at VIT Bhopal University
-AI • Computer Vision • Railway Safety
-Hack4Delhi Participant
