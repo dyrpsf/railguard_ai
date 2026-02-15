@@ -294,5 +294,4 @@ This project is open-source and intended for educational & research purposes.
 👨‍💻 Author
 
 Deepak Yadav <br>
-B.Tech. CSE Core  <br>
-VIT Bhopal University
+B.Tech. CSE Core
