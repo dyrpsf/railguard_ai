@@ -1193,6 +1193,7 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.destroy()
 
 
+
 if __name__ == "__main__":
     app = RailGuardMultiCamApp()
     app.mainloop()
