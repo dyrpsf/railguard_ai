@@ -14,7 +14,7 @@ It supports 1–4 cameras simultaneously and detects track intrusion, obstacles,
 
 📷 Supports:
 - Laptop/USB webcams (`webcam-0`, `webcam-1`, …)
-- IP cameras (e.g. Android phone via IP Webcam)
+- IP cameras (e.g. Android phones via IP Webcam)
 
 🧵 Each camera runs in its own background thread
 
