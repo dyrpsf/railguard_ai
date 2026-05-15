@@ -272,7 +272,7 @@ No sound / TTS errors
     Check system audio output (speakers/headphones).
     Ensure pyttsx3 and playsound3 installed correctly.
     On some systems, you may need extra audio backends (e.g. pyaudio).
-Microphone / speech recognition issues
+    Microphone / speech recognition issues
 
     Ensure a working microphone is selected as default input.
     Check that speech_recognition and its dependencies are installed.
@@ -289,7 +289,7 @@ Microphone / speech recognition issues
 
 📜 License
 
-This project is open-source and intended for educational & research purposes.
+    This project is open-source and intended for educational & research purposes.
 
 👨‍💻 Author
 
