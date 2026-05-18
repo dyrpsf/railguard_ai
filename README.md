@@ -183,7 +183,7 @@ python railguard.py
 6. To stop:
 
     Click Stop in the main window.
-    Or press q in any camera window to close that specific window.
+    Or press `q` in any camera window to close that specific window.
 
 🚨 Alert Logic Explained
 
