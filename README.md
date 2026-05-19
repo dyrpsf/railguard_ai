@@ -136,7 +136,7 @@ You can use a mobile phone as an IP camera.
 
 Android
 
-    Install IP Webcam from Play Store.
+    Install IP Webcam or similar app from Play Store.
     Start the server.
     Use a URL like:
         http://192.168.0.101:8080/video
@@ -174,6 +174,7 @@ python railguard.py
     Draw a rectangle around the railway track.
     Press ENTER/SPACE to confirm, or ESC to cancel.
     If no ROI is selected, that camera will show “NO ROI (Select track)” and will not monitor.
+    
 5. Watch:
     Live camera windows.
     Status updates per camera.
