@@ -1176,7 +1176,7 @@ class RailGuardMultiCamApp(ctk.CTk):
             label="motion threshold",
         )
 
-        self.ax_motion.set_ylabel("Avg Motion")
+        self.ax_motion.set_ylabel("Average Motion")
         self.ax_status.set_ylabel("Status / Occupied\n-1=NoROI,0=G,1=Y,2=R")
         self.ax_status.set_xlabel("Seconds (most recent at 0)")
 
