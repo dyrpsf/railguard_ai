@@ -3,7 +3,6 @@
 RailGuard AI is a real-time, AI-driven railway track monitoring system built using Python, OpenCV, and CustomTkinter.
 It supports 1–4 cameras simultaneously and detects track intrusion, obstacles, and tampering using motion analysis and computer vision.
 
-🏆 Built for Hack4Delhi  
 🎯 Focus: Railway safety, intrusion detection & tampering alerts
 
 ---
