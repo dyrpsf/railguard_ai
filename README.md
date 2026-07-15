@@ -9,7 +9,7 @@ It supports 1–4 cameras simultaneously and detects track intrusion, obstacles,
 
 🔥 Features
 
-🎥 Multi-camera support (1–4 cameras)
+🎥 Multi-camera support (1–4 camera(s))
 
 📷 Supports:
 - Laptop/USB webcams (`webcam-0`, `webcam-1`, …)
