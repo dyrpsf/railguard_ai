@@ -1139,7 +1139,7 @@ class RailGuardMultiCamApp(ctk.CTk):
 
             color = colors[idx % len(colors)]
 
-            # Top: motion + smoothed motion
+            # Top: motion + smoothed motion 
             self.ax_motion.plot(xs, motions, label=f"{cam_id} motion", color=color, linewidth=1.0)
 
             if len(motions) >= 3:
