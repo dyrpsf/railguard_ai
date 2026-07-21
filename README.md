@@ -63,7 +63,7 @@ It supports 1–4 cameras simultaneously and detects track intrusion, obstacles,
 
 🪟 Individual OpenCV video window per camera
 
-📜 Per-camera live log (updated every second)
+📜 Per-camera live log (updated every second).
 
 ---
 
