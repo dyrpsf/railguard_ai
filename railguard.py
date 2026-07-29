@@ -87,7 +87,6 @@ class RailGuardMultiCamApp(ctk.CTk):
         self.capture_dir = Path("captures")
         self.capture_dir.mkdir(exist_ok=True)
 
-        # --- New: global alert / audio state ---
         self.alert_lock = threading.Lock()
         self.current_alert_session: Optional[AlertSession] = None
         self.next_alert_session_id: int = 1
@@ -420,8 +419,6 @@ class RailGuardMultiCamApp(ctk.CTk):
             print(f"[INFO] Saved RED capture for {cam_id} at {filename}")
         except Exception as e:
             print(f"[WARN] Failed to save capture for {cam_id}: {e}")
-
-    # -------- ALERT / AUDIO LOGIC (DETECTION LOGIC UNCHANGED) -------- #
 
     def handle_red_frame(self, cam_id: str, frame, timestamp: float):
         """
@@ -995,8 +992,6 @@ class RailGuardMultiCamApp(ctk.CTk):
                     status="ERROR",
                 )
             )
-
-    # -------------- UI update logic -------------- #
 
     def update_ui(self):
         updated_any = False
