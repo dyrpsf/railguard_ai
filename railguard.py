@@ -677,8 +677,6 @@ class RailGuardMultiCamApp(ctk.CTk):
         except Exception as e:
             print(f"[WARN] Error playing danger alarm: {e}")
 
-    # ----------------------------------------------------------------------- #
-
     @staticmethod
     def rectangles_intersect(box, roi) -> bool:
         """
