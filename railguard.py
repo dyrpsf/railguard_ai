@@ -510,7 +510,7 @@ class RailGuardMultiCamApp(ctk.CTk):
 
         print(f"[INFO] Session {session_id} decision={decision}, recognized={reply_text!r}")
 
-        # 3a) Reaction speech / alarm according to your requirements:
+        # 3b) Reaction speech / alarm according to your requirements:
         #   - ALL_IS_WELL  -> speak polite short 'everything is fine' message
         #   - TAKING_ACTION or OTHER -> speak short 'thank you for taking action' message
         #   - NO_REPLY     -> directly play danger.mp3 (no spoken reply)
